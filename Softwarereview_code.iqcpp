@@ -1,1 +1,801 @@
-{"mode":"Text","hardwareTarget":"brain","textContent":"#pragma region VEXcode Generated Robot Configuration\n// Make sure all required headers are included.\n#include <stdio.h>\n#include <stdlib.h>\n#include <stdbool.h>\n#include <math.h>\n#include <string.h>\n\n\n#include \"vex.h\"\n\nusing namespace vex;\n\n// Brain should be defined by default\nbrain Brain;\n\n\n// START IQ MACROS\n#define waitUntil(condition)                                                   \\\n  do {                                                                         \\\n    wait(5, msec);                                                             \\\n  } while (!(condition))\n\n#define repeat(iterations)                                                     \\\n  for (int iterator = 0; iterator < iterations; iterator++)\n// END IQ MACROS\n\n\n// Robot configuration code.\ninertial BrainInertial = inertial();\n\n\n// generating and setting random seed\nvoid initializeRandomSeed(){\n  wait(100,msec);\n  double xAxis = BrainInertial.acceleration(xaxis) * 1000;\n  double yAxis = BrainInertial.acceleration(yaxis) * 1000;\n  double zAxis = BrainInertial.acceleration(zaxis) * 1000;\n  // Combine these values into a single integer\n  int seed = int(\n    xAxis + yAxis + zAxis\n  );\n  // Set the seed\n  srand(seed); \n}\n\n\n\nvoid vexcodeInit() {\n\n  // Initializing random seed.\n  initializeRandomSeed(); \n}\n\n#pragma endregion VEXcode Generated Robot Configuration\n\n\n\n#include \"vex.h\"\n#include <cmath>\n\nusing namespace vex;\n\n// ==========================================================\n// CARD DEALER - MTE 121\n//\n// Controls (Brain buttons):\n//   Up / Down  = change a value\n//   Check      = confirm / start / finish\n//   Right      = go back and re-enter the setup\n//   Left       = EMERGENCY STOP while dealing\n//\n// Sensors used:\n//   1. Optical sensor (PORT5)  - JAM detection only (card must exit)\n//   2. Inertial sensor (Brain) - gyro measures base rotation\n//   3. Brain buttons           - user input + emergency stop\n//   4. Motor encoders          - feeder degrees per card, base stall check\n//\n// Course rules followed: no global variables (only constants and\n// device objects), no break, no infinite loops, no spinFor,\n// no spinToPosition, no callbacks.\n// ==========================================================\n\n\n// ==========================================================\n// DEVICES  (device objects must be global in VEXcode)\n// ==========================================================\n\nmotor baseMotor(PORT6, false);\nmotor flyWheel(PORT1, true);\nmotor feedMotor(PORT2, true);\noptical OpticalSensor = optical(PORT5);\n\n\n// ==========================================================\n// CONSTANTS (tune these during testing)\n// ==========================================================\n\n// Setup limits\nconst int MIN_PLAYERS = 2;\nconst int MAX_PLAYERS = 8;\nconst int DECK_SIZE   = 52;\n\n// Base rotation (closed loop on the gyro)\nconst double ROTATE_MAX_SPEED   = 30.0;   // percent\nconst double ROTATE_MIN_SPEED   = 8.0;    // percent, must still overcome friction\nconst double ROTATE_KP          = 0.6;    // percent of speed per degree of error\nconst double ROTATE_TOLERANCE   = 1.5;    // degrees\nconst int    SETTLE_MSEC        = 150;    // must stay in tolerance this long\nconst int    ROTATE_TIMEOUT_MSEC = 6000;\nconst int    STALL_MSEC         = 700;    // base not moving while still off target\n\n// Flywheel\nconst double FLYWHEEL_SPEED        = 80.0;\nconst int    FLYWHEEL_STARTUP_MSEC = 400;   // spin-up time before EACH card\nconst int    FLYWHEEL_RUNON_MSEC   = 150;   // flywheel keeps running this long after the feeder finishes, then BRAKES\nconst double FLYWHEEL_STOPPED_RPM  = 5.0;   // below this speed the flywheel counts as stopped\nconst int    FLYWHEEL_STOP_TIMEOUT_MSEC = 1500;\n\n// Card feeder (encoder based: one card = FEED_CARD_ROTATION degrees)\nconst double FEED_SPEED           = 100.0;\nconst double FEED_CARD_ROTATION   = 180.0;  // degrees of feed motor per card (tune!)\nconst double FEED_RETRACT_ROTATION = 40.0;  // degrees to back the feeder off after a card, so the next card is not pushed to the exit\nconst double FEED_HOME_TOLERANCE  = 10.0;   // degrees, \"back at start\" when reversing\nconst int    FEED_TIMEOUT_MSEC    = 2500;   // feeder must reach target within this time\nconst int    CARD_EXIT_WINDOW_MSEC = 400;   // time after feeding to watch for the card\nconst int    UNJAM_TIMEOUT_MSEC   = 2500;\nconst int    MAX_FEED_ATTEMPTS    = 4;\n\n// Optical sensor is ONLY used to detect a jam (card never exited).\n// Set to false to test the encoder dealing without the optical check.\nconst bool OPTICAL_JAM_CHECK_ENABLED = true;\n\n// Optical sensor \"white card\" detection (calibrate on the real robot!)\nconst double WHITE_BRIGHTNESS_MIN = 60.0; // percent\n\n// Gyro\nconst int GYRO_CALIBRATE_TIMEOUT_MSEC = 4000;\n\n// Status codes returned by functions\nconst int DEAL_OK       = 0;\nconst int DEAL_STOPPED  = 1;   // user pressed emergency stop\nconst int DEAL_JAM      = 2;   // card never seen (empty hopper or jam)\nconst int DEAL_BASE_ERR = 3;   // base stalled or timed out\nconst int DEAL_GYRO_ERR = 4;   // gyro failed to calibrate\n\n\n// ==========================================================\n// SMALL HELPERS\n// ==========================================================\n\n// Returns true while the emergency stop button (Left) is held.\nbool stopPressed() {\n    return Brain.buttonLeft.pressing();\n}\n\n// Returns true when the optical sensor sees a white card.\nbool isCardWhite() {\n    return OpticalSensor.isNearObject() &&\n           OpticalSensor.brightness() >= WHITE_BRIGHTNESS_MIN;\n}\n\n// Shows up to two lines of text on the Brain screen.\nvoid showMessage(const char* line1, const char* line2) {\n    Brain.Screen.clearScreen();\n    Brain.Screen.setCursor(1, 1);\n    Brain.Screen.print(\"%s\", line1);\n    Brain.Screen.setCursor(3, 1);\n    Brain.Screen.print(\"%s\", line2);\n}\n\n\n// ==========================================================\n// FUNCTION 1: getSelection\n// Purpose : Let the user pick a whole number with Up/Down and\n//           confirm it with Check. Value is clamped to the range\n//           so invalid input is impossible.\n// Returns : int - the confirmed value\n// Params  : label, minValue, maxValue, startValue\n// Author  : Person A\n// ==========================================================\nint getSelection(const char* label, int minValue, int maxValue, int startValue) {\n\n    int value = startValue;\n    if (value < minValue) value = minValue;\n    if (value > maxValue) value = maxValue;\n\n    bool confirmed = false;\n    bool redraw = true;\n\n    while (!confirmed) {\n\n        if (redraw) {\n            Brain.Screen.clearScreen();\n            Brain.Screen.setCursor(1, 1);\n            Brain.Screen.print(\"%s\", label);\n            Brain.Screen.setCursor(3, 1);\n            Brain.Screen.print(\"Value: %d  (%d-%d)\", value, minValue, maxValue);\n            Brain.Screen.setCursor(5, 1);\n            Brain.Screen.print(\"Up/Down = change\");\n            Brain.Screen.setCursor(6, 1);\n            Brain.Screen.print(\"Check = confirm\");\n            redraw = false;\n        }\n\n        if (Brain.buttonUp.pressing()) {\n            if (value < maxValue) {\n                value++;\n            }\n            redraw = true;\n            while (Brain.buttonUp.pressing()) {\n                wait(10, msec);\n            }\n        }\n        else if (Brain.buttonDown.pressing()) {\n            if (value > minValue) {\n                value--;\n            }\n            redraw = true;\n            while (Brain.buttonDown.pressing()) {\n                wait(10, msec);\n            }\n        }\n        else if (Brain.buttonCheck.pressing()) {\n            confirmed = true;\n            while (Brain.buttonCheck.pressing()) {\n                wait(10, msec);\n            }\n        }\n\n        wait(20, msec);\n    }\n\n    return value;\n}\n\n\n// ==========================================================\n// FUNCTION 2: confirmSetup\n// Purpose : Show the chosen setup and the total cards needed.\n//           Check = start dealing, Right = re-enter the setup.\n// Returns : bool - true to start, false to re-enter\n// Params  : numPlayers, cardsPerPlayer\n// Author  : Person B\n// ==========================================================\nbool confirmSetup(int numPlayers, int cardsPerPlayer) {\n\n    Brain.Screen.clearScreen();\n    Brain.Screen.setCursor(1, 1);\n    Brain.Screen.print(\"Players: %d\", numPlayers);\n    Brain.Screen.setCursor(2, 1);\n    Brain.Screen.print(\"Cards each: %d\", cardsPerPlayer);\n    Brain.Screen.setCursor(3, 1);\n    Brain.Screen.print(\"Total cards: %d\", numPlayers * cardsPerPlayer);\n    Brain.Screen.setCursor(5, 1);\n    Brain.Screen.print(\"Load the cards!\");\n    Brain.Screen.setCursor(6, 1);\n    Brain.Screen.print(\"Check=START Right=redo\");\n\n    bool decided = false;\n    bool startDealing = false;\n\n    while (!decided) {\n\n        if (Brain.buttonCheck.pressing()) {\n            startDealing = true;\n            decided = true;\n        }\n        else if (Brain.buttonRight.pressing()) {\n            startDealing = false;\n            decided = true;\n        }\n\n        wait(20, msec);\n    }\n\n    // wait for the button to be released so it is not seen twice\n    while (Brain.buttonCheck.pressing() || Brain.buttonRight.pressing()) {\n        wait(10, msec);\n    }\n\n    return startDealing;\n}\n\n\n// ==========================================================\n// FUNCTION 3: initializeRobot\n// Purpose : Set motor behaviour, turn on the optical light and\n//           calibrate the gyro (robot must be still).\n// Returns : bool - true if the gyro calibrated in time\n// Params  : none\n// Author  : Person C\n// ==========================================================\nbool initializeRobot() {\n\n    baseMotor.setStopping(hold);\n    baseMotor.setVelocity(ROTATE_MAX_SPEED, percent);\n\n    feedMotor.setStopping(hold);\n    feedMotor.setVelocity(FEED_SPEED, percent);\n\n    flyWheel.setStopping(brake);\n    flyWheel.stop(brake);   // make sure it is not spinning from a previous run\n\n    OpticalSensor.setLight(ledState::on);\n\n    showMessage(\"Calibrating gyro...\", \"Keep robot still\");\n\n    BrainInertial.calibrate();\n\n    timer calTimer;\n    calTimer.reset();\n\n    while (BrainInertial.isCalibrating() &&\n           calTimer.time(msec) < GYRO_CALIBRATE_TIMEOUT_MSEC) {\n        wait(20, msec);\n    }\n\n    BrainInertial.setRotation(0, degrees);\n\n    return !BrainInertial.isCalibrating();\n}\n\n\n// ==========================================================\n// FUNCTION 4: rotateBase\n// Purpose : Turn the base to an ABSOLUTE gyro heading for the\n//           given stop number (stopNumber * 360 / numPlayers).\n//           Using an absolute heading means small errors never\n//           add up from one player to the next. Slows down as it\n//           approaches the target, and watches for a stall/timeout.\n// Returns : int - DEAL_OK, DEAL_STOPPED or DEAL_BASE_ERR\n// Params  : stopNumber (how many moves so far), numPlayers\n// Author  : Person D\n// ==========================================================\nint rotateBase(int stopNumber, int numPlayers) {\n\n    double target = stopNumber * (360.0 / numPlayers);\n\n    timer moveTimer;\n    moveTimer.reset();\n\n    int stableMsec = 0;\n    int stalledMsec = 0;\n    int result = DEAL_OK;\n\n    while (stableMsec < SETTLE_MSEC && result == DEAL_OK) {\n\n        if (stopPressed()) {\n            result = DEAL_STOPPED;\n        }\n        else if (moveTimer.time(msec) > ROTATE_TIMEOUT_MSEC) {\n            result = DEAL_BASE_ERR;\n        }\n        else {\n            double heading = std::fabs(BrainInertial.rotation(degrees));\n            double error = target - heading;\n\n            if (std::fabs(error) <= ROTATE_TOLERANCE) {\n                baseMotor.stop(hold);\n                stableMsec += 10;\n                stalledMsec = 0;\n            }\n            else {\n                stableMsec = 0;\n\n                // proportional speed with a minimum so it never stalls\n                double magnitude = std::fabs(error) * ROTATE_KP;\n                if (magnitude > ROTATE_MAX_SPEED) magnitude = ROTATE_MAX_SPEED;\n                if (magnitude < ROTATE_MIN_SPEED) magnitude = ROTATE_MIN_SPEED;\n\n                double speed = (error > 0) ? magnitude : -magnitude;\n                baseMotor.spin(forward, speed, percent);\n\n                // motor encoder velocity: detect a jammed base\n                if (std::fabs(baseMotor.velocity(rpm)) < 1.0) {\n                    stalledMsec += 10;\n                }\n                else {\n                    stalledMsec = 0;\n                }\n\n                if (stalledMsec >= STALL_MSEC) {\n                    result = DEAL_BASE_ERR;\n                }\n            }\n\n            wait(10, msec);\n        }\n    }\n\n    baseMotor.stop(hold);\n    return result;\n}\n\n\n// ==========================================================\n// FUNCTION 5: spinUpFlywheel\n// Purpose : Start the flywheel and wait for it to reach speed,\n//           while still watching the emergency stop.\n// Returns : int - DEAL_OK or DEAL_STOPPED\n// Params  : none\n// Author  : Person C\n// ==========================================================\nint spinUpFlywheel() {\n\n    flyWheel.spin(forward, FLYWHEEL_SPEED, percent);\n\n    int elapsed = 0;\n    int result = DEAL_OK;\n\n    while (elapsed < FLYWHEEL_STARTUP_MSEC && result == DEAL_OK) {\n\n        if (stopPressed()) {\n            result = DEAL_STOPPED;\n        }\n\n        wait(10, msec);\n        elapsed += 10;\n    }\n\n    return result;\n}\n\n\n// ==========================================================\n// FUNCTION 6: stopFlywheel\n// Purpose : BRAKE the flywheel (not coast) and wait until the\n//         flywheel encoder says it has really stopped, so the\n//         base never turns, and no card sits at the exit, while\n//         the wheel is still spinning.\n// Returns : int - DEAL_OK or DEAL_STOPPED\n// Params  : none\n// Author  : Person C\n// ==========================================================\nint stopFlywheel() {\n\n    flyWheel.stop(brake);\n\n    timer stopTimer;\n    stopTimer.reset();\n\n    int result = DEAL_OK;\n\n    while (std::fabs(flyWheel.velocity(rpm)) > FLYWHEEL_STOPPED_RPM &&\n           stopTimer.time(msec) < FLYWHEEL_STOP_TIMEOUT_MSEC &&\n           result == DEAL_OK) {\n\n        if (stopPressed()) {\n            result = DEAL_STOPPED;\n        }\n\n        wait(10, msec);\n    }\n\n    return result;\n}\n\n\n// ==========================================================\n// FUNCTION 7: feedCard\n// Purpose : Push out ONE card by spinning the feed motor\n//         FEED_CARD_ROTATION degrees (measured with the motor\n//         encoder). The optical sensor is watched during the push\n//         and for a short window afterwards; if it never sees the\n//         white card leave, the card is reported as jammed.\n// Returns : int - DEAL_OK, DEAL_STOPPED or DEAL_JAM\n// Params  : none\n// Author  : Person A\n// ==========================================================\nint feedCard() {\n\n    timer feedTimer;\n    feedTimer.reset();\n\n    int result = DEAL_OK;\n    bool cardSeen = false;\n    bool flywheelOff = false;\n\n    feedMotor.setPosition(0, degrees);\n    feedMotor.spin(forward, FEED_SPEED, percent);\n\n    // Phase 1: spin until the encoder reaches the card distance\n    while (std::fabs(feedMotor.position(degrees)) < FEED_CARD_ROTATION &&\n           result == DEAL_OK) {\n\n        if (stopPressed()) {\n            result = DEAL_STOPPED;\n        }\n        else if (feedTimer.time(msec) > FEED_TIMEOUT_MSEC) {\n            result = DEAL_JAM;   // feeder could not turn far enough\n        }\n\n        if (isCardWhite()) {\n            cardSeen = true;\n        }\n\n        wait(5, msec);\n    }\n\n    feedMotor.stop(hold);\n\n    // Phase 2: give the card time to leave, still watching the sensor.\n    // (Also stops the base from turning while a card is still in flight.)\n    feedTimer.reset();\n\n    while (feedTimer.time(msec) < CARD_EXIT_WINDOW_MSEC && result == DEAL_OK) {\n\n        // flywheel only runs a moment after the feeder finishes, then brakes\n        if (!flywheelOff && feedTimer.time(msec) >= FLYWHEEL_RUNON_MSEC) {\n            flyWheel.stop(brake);\n            flywheelOff = true;\n        }\n\n        if (stopPressed()) {\n            result = DEAL_STOPPED;\n        }\n\n        if (isCardWhite()) {\n            cardSeen = true;\n        }\n\n        wait(5, msec);\n    }\n\n    if (result == DEAL_OK && OPTICAL_JAM_CHECK_ENABLED && !cardSeen) {\n        result = DEAL_JAM;\n    }\n\n    return result;\n}\n\n\n// ==========================================================\n// FUNCTION 8: unjamFeeder\n// Purpose : Recover from a jam. Reverses the feeder (back to its\n//         start position, measured by the encoder) and the flywheel,\n//         then stops the flywheel. (dealOneCard spins it up again\n//         for the next attempt.)\n// Returns : int - DEAL_OK or DEAL_STOPPED\n// Params  : none\n// Author  : Person D\n// ==========================================================\nint unjamFeeder() {\n\n    showMessage(\"Jam detected\", \"Reversing + retrying\");\n\n    timer unjamTimer;\n    unjamTimer.reset();\n\n    int result = DEAL_OK;\n\n    flyWheel.spin(reverse, FLYWHEEL_SPEED, percent);\n    feedMotor.spin(reverse, FEED_SPEED, percent);\n\n    while (std::fabs(feedMotor.position(degrees)) > FEED_HOME_TOLERANCE &&\n           unjamTimer.time(msec) < UNJAM_TIMEOUT_MSEC &&\n           result == DEAL_OK) {\n\n        if (stopPressed()) {\n            result = DEAL_STOPPED;\n        }\n\n        wait(5, msec);\n    }\n\n    feedMotor.stop(hold);\n\n    int stopResult = stopFlywheel();\n    if (result == DEAL_OK) {\n        result = stopResult;\n    }\n\n    return result;\n}\n\n\n// ==========================================================\n// FUNCTION 9: retractFeeder\n// Purpose : After a card has been dealt (flywheel already\n//         stopped), back the feeder off by FEED_RETRACT_ROTATION\n//         degrees so the next card is not pushed all the way to\n//         the exit. Uses the feed motor encoder.\n// Returns : int - DEAL_OK or DEAL_STOPPED\n// Params  : none\n// Author  : Person B\n// ==========================================================\nint retractFeeder() {\n\n    timer retractTimer;\n    retractTimer.reset();\n\n    int result = DEAL_OK;\n    double retractTarget = FEED_CARD_ROTATION - FEED_RETRACT_ROTATION;\n\n    feedMotor.spin(reverse, FEED_SPEED, percent);\n\n    while (std::fabs(feedMotor.position(degrees)) > retractTarget &&\n           retractTimer.time(msec) < UNJAM_TIMEOUT_MSEC &&\n           result == DEAL_OK) {\n\n        if (stopPressed()) {\n            result = DEAL_STOPPED;\n        }\n\n        wait(5, msec);\n    }\n\n    feedMotor.stop(hold);\n    return result;\n}\n\n\n// ==========================================================\n// FUNCTION 10: dealOneCard\n// Purpose : Deal exactly one card. The flywheel is ONLY running\n//         while the card is being fed: spin up -> feed -> stop.\n//         If the optical sensor says the card did not exit,\n//         reverse and try again, up to MAX_FEED_ATTEMPTS times\n//         (handles the \"unexpected input\" of a jammed card).\n//         After a good deal the feeder is backed off slightly.\n// Returns : int - DEAL_OK, DEAL_STOPPED or DEAL_JAM\n// Params  : none\n// Author  : Person B\n// ==========================================================\nint dealOneCard() {\n\n    int result = DEAL_JAM;\n    int attempt = 0;\n\n    while (result == DEAL_JAM && attempt < MAX_FEED_ATTEMPTS) {\n\n        result = spinUpFlywheel();\n\n        if (result == DEAL_OK) {\n            result = feedCard();\n        }\n\n        // flywheel only runs while dealing: brake and wait until it has stopped\n        int stopResult = stopFlywheel();\n        if (stopResult != DEAL_OK) {\n            result = stopResult;\n        }\n        attempt++;\n\n        if (result == DEAL_JAM && attempt < MAX_FEED_ATTEMPTS) {\n            int unjamResult = unjamFeeder();\n\n            if (unjamResult != DEAL_OK) {\n                result = unjamResult;   // user stopped during recovery\n            }\n        }\n    }\n\n    if (result == DEAL_OK) {\n        result = retractFeeder();\n    }\n\n    return result;\n}\n\n\n// ==========================================================\n// FUNCTION 11: showDealStatus\n// Purpose : Update the Brain screen during dealing, including the\n//           live optical brightness so the white threshold can be\n//           calibrated.\n// Returns : nothing\n// Params  : cardsDealt, totalCards, playerNumber\n// Author  : Person D\n// ==========================================================\nvoid showDealStatus(int cardsDealt, int totalCards, int playerNumber) {\n\n    Brain.Screen.clearScreen();\n    Brain.Screen.setCursor(1, 1);\n    Brain.Screen.print(\"DEALING\");\n    Brain.Screen.setCursor(2, 1);\n    Brain.Screen.print(\"Card %d of %d\", cardsDealt + 1, totalCards);\n    Brain.Screen.setCursor(3, 1);\n    Brain.Screen.print(\"To player %d\", playerNumber);\n    Brain.Screen.setCursor(4, 1);\n    Brain.Screen.print(\"Brightness: %.0f\", OpticalSensor.brightness());\n    Brain.Screen.setCursor(6, 1);\n    Brain.Screen.print(\"Left = STOP\");\n}\n\n\n// ==========================================================\n// FUNCTION 12: dealAllCards\n// Purpose : Main dealing routine. Deals cardsPerPlayer rounds\n//           around the table. After every card the base turns to\n//           the next player; after the last card the base has made\n//           complete turns and is back at its start position.\n// Returns : int - DEAL_OK or the error/stop code that ended it\n// Params  : numPlayers, cardsPerPlayer\n// Author  : Person A (with whole team review)\n// ==========================================================\nint dealAllCards(int numPlayers, int cardsPerPlayer) {\n\n    int totalCards = numPlayers * cardsPerPlayer;\n    int cardsDealt = 0;\n\n    int status = DEAL_OK;\n\n    while (status == DEAL_OK && cardsDealt < totalCards) {\n\n        int playerNumber = (cardsDealt % numPlayers) + 1;\n        showDealStatus(cardsDealt, totalCards, playerNumber);\n\n        status = dealOneCard();\n\n        if (status == DEAL_OK) {\n            cardsDealt++;\n            status = rotateBase(cardsDealt, numPlayers);\n        }\n    }\n\n    return status;\n}\n\n\n// ==========================================================\n// FUNCTION 13: shutdownRobot\n// Purpose : Stop every motor, tell the user how the run ended,\n//           and wait for Check before the program ends. This is\n//           the normal shutdown (no need to hit abort).\n// Returns : nothing\n// Params  : status (one of the DEAL_ codes)\n// Author  : Person C\n// ==========================================================\nvoid shutdownRobot(int status) {\n\n    baseMotor.stop(hold);\n    feedMotor.stop(hold);\n    flyWheel.stop(brake);\n    OpticalSensor.setLight(ledState::off);\n\n    if (status == DEAL_OK) {\n        showMessage(\"Dealing complete!\", \"Press Check to exit\");\n    }\n    else if (status == DEAL_STOPPED) {\n        showMessage(\"Stopped by user\", \"Press Check to exit\");\n    }\n    else if (status == DEAL_JAM) {\n        showMessage(\"Card not exiting\", \"Empty hopper or jam\");\n    }\n    else if (status == DEAL_BASE_ERR) {\n        showMessage(\"Base stuck/timeout\", \"Check the turntable\");\n    }\n    else {\n        showMessage(\"Gyro failed\", \"Restart the robot\");\n    }\n\n    Brain.Screen.setCursor(5, 1);\n    Brain.Screen.print(\"Press Check to exit\");\n\n    while (!Brain.buttonCheck.pressing()) {\n        wait(20, msec);\n    }\n\n    Brain.Screen.clearScreen();\n}\n\n\n// ==========================================================\n// MAIN\n// ==========================================================\nint main() {\n\n    vexcodeInit();\n\n    int status = DEAL_OK;\n\n    if (!initializeRobot()) {\n        status = DEAL_GYRO_ERR;\n    }\n    else {\n\n        int numPlayers = 4;\n        int cardsPerPlayer = 1;\n        bool ready = false;\n\n        while (!ready) {\n            numPlayers = getSelection(\"How many players?\",\n                                      MIN_PLAYERS, MAX_PLAYERS, numPlayers);\n\n            // never allow more cards than are in the deck\n            int maxCards = DECK_SIZE / numPlayers;\n            cardsPerPlayer = getSelection(\"Cards per player?\",\n                                          1, maxCards, cardsPerPlayer);\n\n            ready = confirmSetup(numPlayers, cardsPerPlayer);\n        }\n\n        status = dealAllCards(numPlayers, cardsPerPlayer);\n    }\n\n    shutdownRobot(status);\n\n    return 0;\n}","textLanguage":"cpp","robotConfig":[],"slot":0,"platform":"IQ","sdkVersion":"20230818.11.00.00","appVersion":"4.68.1","fileFormat":"2.0.0","targetBrainGen":"Second","v5SoundsEnabled":false,"aiVisionSettings":{"colors":[],"codes":[],"tags":true,"AIObjects":true,"AIObjectModel":[],"aiModelDropDownValue":null}}
+#pragma region VEXcode Generated Robot Configuration
+// Make sure all required headers are included.
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <math.h>
+#include <string.h>
+
+
+#include "vex.h"
+
+using namespace vex;
+
+// Brain should be defined by default
+brain Brain;
+
+
+// START IQ MACROS
+#define waitUntil(condition)                                                   \
+  do {                                                                         \
+    wait(5, msec);                                                             \
+  } while (!(condition))
+
+#define repeat(iterations)                                                     \
+  for (int iterator = 0; iterator < iterations; iterator++)
+// END IQ MACROS
+
+
+// Robot configuration code.
+inertial BrainInertial = inertial();
+
+
+// generating and setting random seed
+void initializeRandomSeed(){
+  wait(100,msec);
+  double xAxis = BrainInertial.acceleration(xaxis) * 1000;
+  double yAxis = BrainInertial.acceleration(yaxis) * 1000;
+  double zAxis = BrainInertial.acceleration(zaxis) * 1000;
+  // Combine these values into a single integer
+  int seed = int(
+    xAxis + yAxis + zAxis
+  );
+  // Set the seed
+  srand(seed); 
+}
+
+
+
+void vexcodeInit() {
+
+  // Initializing random seed.
+  initializeRandomSeed(); 
+}
+
+#pragma endregion VEXcode Generated Robot Configuration
+
+
+
+#include "vex.h"
+#include <cmath>
+
+using namespace vex;
+
+// ==========================================================
+// CARD DEALER - MTE 121
+//
+// Controls (Brain buttons):
+//   Up / Down  = change a value
+//   Check      = confirm / start / finish
+//   Right      = go back and re-enter the setup
+//   Left       = EMERGENCY STOP while dealing
+//
+// Sensors used:
+//   1. Optical sensor (PORT5)  - JAM detection only (card must exit)
+//   2. Inertial sensor (Brain) - gyro measures base rotation
+//   3. Brain buttons           - user input + emergency stop
+//   4. Motor encoders          - feeder degrees per card, base stall check
+//
+// Course rules followed: no global variables (only constants and
+// device objects), no break, no infinite loops, no spinFor,
+// no spinToPosition, no callbacks.
+// ==========================================================
+
+
+// ==========================================================
+// DEVICES  (device objects must be global in VEXcode)
+// ==========================================================
+
+motor baseMotor(PORT6, false);
+motor flyWheel(PORT1, true);
+motor feedMotor(PORT2, true);
+optical OpticalSensor = optical(PORT5);
+
+
+// ==========================================================
+// CONSTANTS (tune these during testing)
+// ==========================================================
+
+// Setup limits
+const int MIN_PLAYERS = 2;
+const int MAX_PLAYERS = 8;
+const int DECK_SIZE   = 52;
+
+// Base rotation (closed loop on the gyro)
+const double ROTATE_MAX_SPEED   = 30.0;   // percent
+const double ROTATE_MIN_SPEED   = 8.0;    // percent, must still overcome friction
+const double ROTATE_KP          = 0.6;    // percent of speed per degree of error
+const double ROTATE_TOLERANCE   = 1.5;    // degrees
+const int    SETTLE_MSEC        = 150;    // must stay in tolerance this long
+const int    ROTATE_TIMEOUT_MSEC = 6000;
+const int    STALL_MSEC         = 700;    // base not moving while still off target
+
+// Flywheel
+const double FLYWHEEL_SPEED        = 80.0;
+const int    FLYWHEEL_STARTUP_MSEC = 400;   // spin-up time before EACH card
+const int    FLYWHEEL_RUNON_MSEC   = 150;   // flywheel keeps running this long after the feeder finishes, then BRAKES
+const double FLYWHEEL_STOPPED_RPM  = 5.0;   // below this speed the flywheel counts as stopped
+const int    FLYWHEEL_STOP_TIMEOUT_MSEC = 1500;
+
+// Card feeder (encoder based: one card = FEED_CARD_ROTATION degrees)
+const double FEED_SPEED           = 100.0;
+const double FEED_CARD_ROTATION   = 160.0;  // degrees of feed motor per card (tune!)
+const double FEED_RETRACT_ROTATION = 50.0;  // degrees to back the feeder off after a card, so the next card is not pushed to the exit
+const double FEED_HOME_TOLERANCE  = 10.0;   // degrees, "back at start" when reversing
+const int    FEED_TIMEOUT_MSEC    = 2500;   // feeder must reach target within this time
+const int    CARD_EXIT_WINDOW_MSEC = 400;   // time after feeding to watch for the card
+const int    UNJAM_TIMEOUT_MSEC   = 2500;
+const int    MAX_FEED_ATTEMPTS    = 4;
+
+// Optical sensor is ONLY used to detect a jam (card never exited).
+// Set to false to test the encoder dealing without the optical check.
+const bool OPTICAL_JAM_CHECK_ENABLED = true;
+
+// Optical sensor "white card" detection (calibrate on the real robot!)
+const double WHITE_BRIGHTNESS_MIN = 60.0; // percent
+
+// Gyro
+const int GYRO_CALIBRATE_TIMEOUT_MSEC = 4000;
+
+// Status codes returned by functions
+const int DEAL_OK       = 0;
+const int DEAL_STOPPED  = 1;   // user pressed emergency stop
+const int DEAL_JAM      = 2;   // card never seen (empty hopper or jam)
+const int DEAL_BASE_ERR = 3;   // base stalled or timed out
+const int DEAL_GYRO_ERR = 4;   // gyro failed to calibrate
+
+
+// ==========================================================
+// SMALL HELPERS
+// ==========================================================
+
+// Returns true while the emergency stop button (Left) is held.
+bool stopPressed() {
+    return Brain.buttonLeft.pressing();
+}
+
+// Returns true when the optical sensor sees a white card.
+bool isCardWhite() {
+    return OpticalSensor.isNearObject() &&
+           OpticalSensor.brightness() >= WHITE_BRIGHTNESS_MIN;
+}
+
+// Shows up to two lines of text on the Brain screen.
+void showMessage(const char* line1, const char* line2) {
+    Brain.Screen.clearScreen();
+    Brain.Screen.setCursor(1, 1);
+    Brain.Screen.print("%s", line1);
+    Brain.Screen.setCursor(3, 1);
+    Brain.Screen.print("%s", line2);
+}
+
+
+// ==========================================================
+// FUNCTION 1: getSelection
+// Purpose : Let the user pick a whole number with Up/Down and
+//           confirm it with Check. Value is clamped to the range
+//           so invalid input is impossible.
+// Returns : int - the confirmed value
+// Params  : label, minValue, maxValue, startValue
+// Author  : Person A
+// ==========================================================
+int getSelection(const char* label, int minValue, int maxValue, int startValue) {
+
+    int value = startValue;
+    if (value < minValue) value = minValue;
+    if (value > maxValue) value = maxValue;
+
+    bool confirmed = false;
+    bool redraw = true;
+
+    while (!confirmed) {
+
+        if (redraw) {
+            Brain.Screen.clearScreen();
+            Brain.Screen.setCursor(1, 1);
+            Brain.Screen.print("%s", label);
+            Brain.Screen.setCursor(3, 1);
+            Brain.Screen.print("Value: %d  (%d-%d)", value, minValue, maxValue);
+            Brain.Screen.setCursor(5, 1);
+            Brain.Screen.print("Up/Down = change");
+            Brain.Screen.setCursor(6, 1);
+            Brain.Screen.print("Check = confirm");
+            redraw = false;
+        }
+
+        if (Brain.buttonUp.pressing()) {
+            if (value < maxValue) {
+                value++;
+            }
+            redraw = true;
+            while (Brain.buttonUp.pressing()) {
+                wait(10, msec);
+            }
+        }
+        else if (Brain.buttonDown.pressing()) {
+            if (value > minValue) {
+                value--;
+            }
+            redraw = true;
+            while (Brain.buttonDown.pressing()) {
+                wait(10, msec);
+            }
+        }
+        else if (Brain.buttonCheck.pressing()) {
+            confirmed = true;
+            while (Brain.buttonCheck.pressing()) {
+                wait(10, msec);
+            }
+        }
+
+        wait(20, msec);
+    }
+
+    return value;
+}
+
+
+// ==========================================================
+// FUNCTION 2: confirmSetup
+// Purpose : Show the chosen setup and the total cards needed.
+//           Check = start dealing, Right = re-enter the setup.
+// Returns : bool - true to start, false to re-enter
+// Params  : numPlayers, cardsPerPlayer
+// Author  : Person B
+// ==========================================================
+bool confirmSetup(int numPlayers, int cardsPerPlayer) {
+
+    Brain.Screen.clearScreen();
+    Brain.Screen.setCursor(1, 1);
+    Brain.Screen.print("Players: %d", numPlayers);
+    Brain.Screen.setCursor(2, 1);
+    Brain.Screen.print("Cards each: %d", cardsPerPlayer);
+    Brain.Screen.setCursor(3, 1);
+    Brain.Screen.print("Total cards: %d", numPlayers * cardsPerPlayer);
+    Brain.Screen.setCursor(5, 1);
+    Brain.Screen.print("Load the cards!");
+    Brain.Screen.setCursor(6, 1);
+    Brain.Screen.print("Check=START Right=redo");
+
+    bool decided = false;
+    bool startDealing = false;
+
+    while (!decided) {
+
+        if (Brain.buttonCheck.pressing()) {
+            startDealing = true;
+            decided = true;
+        }
+        else if (Brain.buttonRight.pressing()) {
+            startDealing = false;
+            decided = true;
+        }
+
+        wait(20, msec);
+    }
+
+    // wait for the button to be released so it is not seen twice
+    while (Brain.buttonCheck.pressing() || Brain.buttonRight.pressing()) {
+        wait(10, msec);
+    }
+
+    return startDealing;
+}
+
+
+// ==========================================================
+// FUNCTION 3: initializeRobot
+// Purpose : Set motor behaviour, turn on the optical light and
+//           calibrate the gyro (robot must be still).
+// Returns : bool - true if the gyro calibrated in time
+// Params  : none
+// Author  : Person C
+// ==========================================================
+bool initializeRobot() {
+
+    baseMotor.setStopping(hold);
+    baseMotor.setVelocity(ROTATE_MAX_SPEED, percent);
+
+    feedMotor.setStopping(hold);
+    feedMotor.setVelocity(FEED_SPEED, percent);
+
+    flyWheel.setStopping(brake);
+    flyWheel.stop(brake);   // make sure it is not spinning from a previous run
+
+    OpticalSensor.setLight(ledState::on);
+
+    showMessage("Calibrating gyro...", "Keep robot still");
+
+    BrainInertial.calibrate();
+
+    timer calTimer;
+    calTimer.reset();
+
+    while (BrainInertial.isCalibrating() &&
+           calTimer.time(msec) < GYRO_CALIBRATE_TIMEOUT_MSEC) {
+        wait(20, msec);
+    }
+
+    BrainInertial.setRotation(0, degrees);
+
+    return !BrainInertial.isCalibrating();
+}
+
+
+// ==========================================================
+// FUNCTION 4: rotateBase
+// Purpose : Turn the base to an ABSOLUTE gyro heading for the
+//           given stop number (stopNumber * 360 / numPlayers).
+//           Using an absolute heading means small errors never
+//           add up from one player to the next. Slows down as it
+//           approaches the target, and watches for a stall/timeout.
+// Returns : int - DEAL_OK, DEAL_STOPPED or DEAL_BASE_ERR
+// Params  : stopNumber (how many moves so far), numPlayers
+// Author  : Person D
+// ==========================================================
+int rotateBase(int stopNumber, int numPlayers) {
+
+    double target = stopNumber * (360.0 / numPlayers);
+
+    timer moveTimer;
+    moveTimer.reset();
+
+    int stableMsec = 0;
+    int stalledMsec = 0;
+    int result = DEAL_OK;
+
+    while (stableMsec < SETTLE_MSEC && result == DEAL_OK) {
+
+        if (stopPressed()) {
+            result = DEAL_STOPPED;
+        }
+        else if (moveTimer.time(msec) > ROTATE_TIMEOUT_MSEC) {
+            result = DEAL_BASE_ERR;
+        }
+        else {
+            double heading = std::fabs(BrainInertial.rotation(degrees));
+            double error = target - heading;
+
+            if (std::fabs(error) <= ROTATE_TOLERANCE) {
+                baseMotor.stop(hold);
+                stableMsec += 10;
+                stalledMsec = 0;
+            }
+            else {
+                stableMsec = 0;
+
+                // proportional speed with a minimum so it never stalls
+                double magnitude = std::fabs(error) * ROTATE_KP;
+                if (magnitude > ROTATE_MAX_SPEED) magnitude = ROTATE_MAX_SPEED;
+                if (magnitude < ROTATE_MIN_SPEED) magnitude = ROTATE_MIN_SPEED;
+
+                double speed = (error > 0) ? magnitude : -magnitude;
+                baseMotor.spin(forward, speed, percent);
+
+                // motor encoder velocity: detect a jammed base
+                if (std::fabs(baseMotor.velocity(rpm)) < 1.0) {
+                    stalledMsec += 10;
+                }
+                else {
+                    stalledMsec = 0;
+                }
+
+                if (stalledMsec >= STALL_MSEC) {
+                    result = DEAL_BASE_ERR;
+                }
+            }
+
+            wait(10, msec);
+        }
+    }
+
+    baseMotor.stop(hold);
+    return result;
+}
+
+
+// ==========================================================
+// FUNCTION 5: spinUpFlywheel
+// Purpose : Start the flywheel and wait for it to reach speed,
+//           while still watching the emergency stop.
+// Returns : int - DEAL_OK or DEAL_STOPPED
+// Params  : none
+// Author  : Person C
+// ==========================================================
+int spinUpFlywheel() {
+
+    flyWheel.spin(forward, FLYWHEEL_SPEED, percent);
+
+    int elapsed = 0;
+    int result = DEAL_OK;
+
+    while (elapsed < FLYWHEEL_STARTUP_MSEC && result == DEAL_OK) {
+
+        if (stopPressed()) {
+            result = DEAL_STOPPED;
+        }
+
+        wait(10, msec);
+        elapsed += 10;
+    }
+
+    return result;
+}
+
+
+// ==========================================================
+// FUNCTION 6: stopFlywheel
+// Purpose : BRAKE the flywheel (not coast) and wait until the
+//         flywheel encoder says it has really stopped, so the
+//         base never turns, and no card sits at the exit, while
+//         the wheel is still spinning.
+// Returns : int - DEAL_OK or DEAL_STOPPED
+// Params  : none
+// Author  : Person C
+// ==========================================================
+int stopFlywheel() {
+
+    flyWheel.stop(brake);
+
+    timer stopTimer;
+    stopTimer.reset();
+
+    int result = DEAL_OK;
+
+    while (std::fabs(flyWheel.velocity(rpm)) > FLYWHEEL_STOPPED_RPM &&
+           stopTimer.time(msec) < FLYWHEEL_STOP_TIMEOUT_MSEC &&
+           result == DEAL_OK) {
+
+        if (stopPressed()) {
+            result = DEAL_STOPPED;
+        }
+
+        wait(10, msec);
+    }
+
+    return result;
+}
+
+
+// ==========================================================
+// FUNCTION 7: feedCard
+// Purpose : Push out ONE card by spinning the feed motor
+//         FEED_CARD_ROTATION degrees (measured with the motor
+//         encoder). The optical sensor is watched during the push
+//         and for a short window afterwards; if it never sees the
+//         white card leave, the card is reported as jammed.
+// Returns : int - DEAL_OK, DEAL_STOPPED or DEAL_JAM
+// Params  : none
+// Author  : Person A
+// ==========================================================
+int feedCard() {
+
+    timer feedTimer;
+    feedTimer.reset();
+
+    int result = DEAL_OK;
+    bool cardSeen = false;
+    bool flywheelOff = false;
+
+    feedMotor.setPosition(0, degrees);
+    feedMotor.spin(forward, FEED_SPEED, percent);
+
+    // Phase 1: spin until the encoder reaches the card distance
+    while (std::fabs(feedMotor.position(degrees)) < FEED_CARD_ROTATION &&
+           result == DEAL_OK) {
+
+        if (stopPressed()) {
+            result = DEAL_STOPPED;
+        }
+        else if (feedTimer.time(msec) > FEED_TIMEOUT_MSEC) {
+            result = DEAL_JAM;   // feeder could not turn far enough
+        }
+
+        if (isCardWhite()) {
+            cardSeen = true;
+        }
+
+        wait(5, msec);
+    }
+
+    feedMotor.stop(hold);
+
+    // Phase 2: give the card time to leave, still watching the sensor.
+    // (Also stops the base from turning while a card is still in flight.)
+    feedTimer.reset();
+
+    while (feedTimer.time(msec) < CARD_EXIT_WINDOW_MSEC && result == DEAL_OK) {
+
+        // flywheel only runs a moment after the feeder finishes, then brakes
+        if (!flywheelOff && feedTimer.time(msec) >= FLYWHEEL_RUNON_MSEC) {
+            flyWheel.stop(brake);
+            flywheelOff = true;
+        }
+
+        if (stopPressed()) {
+            result = DEAL_STOPPED;
+        }
+
+        if (isCardWhite()) {
+            cardSeen = true;
+        }
+
+        wait(5, msec);
+    }
+
+    if (result == DEAL_OK && OPTICAL_JAM_CHECK_ENABLED && !cardSeen) {
+        result = DEAL_JAM;
+    }
+
+    return result;
+}
+
+
+// ==========================================================
+// FUNCTION 8: unjamFeeder
+// Purpose : Recover from a jam. Reverses the feeder (back to its
+//         start position, measured by the encoder) and the flywheel,
+//         then stops the flywheel. (dealOneCard spins it up again
+//         for the next attempt.)
+// Returns : int - DEAL_OK or DEAL_STOPPED
+// Params  : none
+// Author  : Person D
+// ==========================================================
+int unjamFeeder() {
+
+    showMessage("Jam detected", "Reversing + retrying");
+
+    timer unjamTimer;
+    unjamTimer.reset();
+
+    int result = DEAL_OK;
+
+    flyWheel.spin(reverse, FLYWHEEL_SPEED, percent);
+    feedMotor.spin(reverse, FEED_SPEED, percent);
+
+    while (std::fabs(feedMotor.position(degrees)) > FEED_HOME_TOLERANCE &&
+           unjamTimer.time(msec) < UNJAM_TIMEOUT_MSEC &&
+           result == DEAL_OK) {
+
+        if (stopPressed()) {
+            result = DEAL_STOPPED;
+        }
+
+        wait(5, msec);
+    }
+
+    feedMotor.stop(hold);
+
+    int stopResult = stopFlywheel();
+    if (result == DEAL_OK) {
+        result = stopResult;
+    }
+
+    return result;
+}
+
+
+// ==========================================================
+// FUNCTION 9: retractFeeder
+// Purpose : After a card has been dealt (flywheel already
+//         stopped), back the feeder off by FEED_RETRACT_ROTATION
+//         degrees so the next card is not pushed all the way to
+//         the exit. Uses the feed motor encoder.
+// Returns : int - DEAL_OK or DEAL_STOPPED
+// Params  : none
+// Author  : Person B
+// ==========================================================
+int retractFeeder() {
+
+    timer retractTimer;
+    retractTimer.reset();
+
+    int result = DEAL_OK;
+    double retractTarget = FEED_CARD_ROTATION - FEED_RETRACT_ROTATION;
+
+    feedMotor.spin(reverse, FEED_SPEED, percent);
+
+    while (std::fabs(feedMotor.position(degrees)) > retractTarget &&
+           retractTimer.time(msec) < UNJAM_TIMEOUT_MSEC &&
+           result == DEAL_OK) {
+
+        if (stopPressed()) {
+            result = DEAL_STOPPED;
+        }
+
+        wait(5, msec);
+    }
+
+    feedMotor.stop(hold);
+    return result;
+}
+
+
+// ==========================================================
+// FUNCTION 10: dealOneCard
+// Purpose : Deal exactly one card. The flywheel is ONLY running
+//         while the card is being fed: spin up -> feed -> stop.
+//         If the optical sensor says the card did not exit,
+//         reverse and try again, up to MAX_FEED_ATTEMPTS times
+//         (handles the "unexpected input" of a jammed card).
+//         After a good deal the feeder is backed off slightly.
+// Returns : int - DEAL_OK, DEAL_STOPPED or DEAL_JAM
+// Params  : none
+// Author  : Person B
+// ==========================================================
+int dealOneCard() {
+
+    int result = DEAL_JAM;
+    int attempt = 0;
+
+    while (result == DEAL_JAM && attempt < MAX_FEED_ATTEMPTS) {
+
+        result = spinUpFlywheel();
+
+        if (result == DEAL_OK) {
+            result = feedCard();
+        }
+
+        // flywheel only runs while dealing: brake and wait until it has stopped
+        int stopResult = stopFlywheel();
+        if (stopResult != DEAL_OK) {
+            result = stopResult;
+        }
+        attempt++;
+
+        if (result == DEAL_JAM && attempt < MAX_FEED_ATTEMPTS) {
+            int unjamResult = unjamFeeder();
+
+            if (unjamResult != DEAL_OK) {
+                result = unjamResult;   // user stopped during recovery
+            }
+        }
+    }
+
+    if (result == DEAL_OK) {
+        result = retractFeeder();
+    }
+
+    return result;
+}
+
+
+// ==========================================================
+// FUNCTION 11: showDealStatus
+// Purpose : Update the Brain screen during dealing, including the
+//           live optical brightness so the white threshold can be
+//           calibrated.
+// Returns : nothing
+// Params  : cardsDealt, totalCards, playerNumber
+// Author  : Person D
+// ==========================================================
+void showDealStatus(int cardsDealt, int totalCards, int playerNumber) {
+
+    Brain.Screen.clearScreen();
+    Brain.Screen.setCursor(1, 1);
+    Brain.Screen.print("DEALING");
+    Brain.Screen.setCursor(2, 1);
+    Brain.Screen.print("Card %d of %d", cardsDealt + 1, totalCards);
+    Brain.Screen.setCursor(3, 1);
+    Brain.Screen.print("To player %d", playerNumber);
+    Brain.Screen.setCursor(4, 1);
+    Brain.Screen.print("Brightness: %.0f", OpticalSensor.brightness());
+    Brain.Screen.setCursor(6, 1);
+    Brain.Screen.print("Left = STOP");
+}
+
+
+// ==========================================================
+// FUNCTION 12: dealAllCards
+// Purpose : Main dealing routine. Deals cardsPerPlayer rounds
+//           around the table. After every card the base turns to
+//           the next player; after the last card the base has made
+//           complete turns and is back at its start position.
+// Returns : int - DEAL_OK or the error/stop code that ended it
+// Params  : numPlayers, cardsPerPlayer
+// Author  : Person A (with whole team review)
+// ==========================================================
+int dealAllCards(int numPlayers, int cardsPerPlayer) {
+
+    int totalCards = numPlayers * cardsPerPlayer;
+    int cardsDealt = 0;
+
+    int status = DEAL_OK;
+
+    while (status == DEAL_OK && cardsDealt < totalCards) {
+
+        int playerNumber = (cardsDealt % numPlayers) + 1;
+        showDealStatus(cardsDealt, totalCards, playerNumber);
+
+        status = dealOneCard();
+
+        if (status == DEAL_OK) {
+            cardsDealt++;
+            status = rotateBase(cardsDealt, numPlayers);
+        }
+    }
+
+    return status;
+}
+
+
+// ==========================================================
+// FUNCTION 13: shutdownRobot
+// Purpose : Stop every motor, tell the user how the run ended,
+//           and wait for Check before the program ends. This is
+//           the normal shutdown (no need to hit abort).
+// Returns : nothing
+// Params  : status (one of the DEAL_ codes)
+// Author  : Person C
+// ==========================================================
+void shutdownRobot(int status) {
+
+    baseMotor.stop(hold);
+    feedMotor.stop(hold);
+    flyWheel.stop(brake);
+    OpticalSensor.setLight(ledState::off);
+
+    if (status == DEAL_OK) {
+        showMessage("Dealing complete!", "Press Check to exit");
+    }
+    else if (status == DEAL_STOPPED) {
+        showMessage("Stopped by user", "Press Check to exit");
+    }
+    else if (status == DEAL_JAM) {
+        showMessage("Card not exiting", "Empty hopper or jam");
+    }
+    else if (status == DEAL_BASE_ERR) {
+        showMessage("Base stuck/timeout", "Check the turntable");
+    }
+    else {
+        showMessage("Gyro failed", "Restart the robot");
+    }
+
+    Brain.Screen.setCursor(5, 1);
+    Brain.Screen.print("Press Check to exit");
+
+    while (!Brain.buttonCheck.pressing()) {
+        wait(20, msec);
+    }
+
+    Brain.Screen.clearScreen();
+}
+
+
+// ==========================================================
+// MAIN
+// ==========================================================
+int main() {
+
+    vexcodeInit();
+
+    int status = DEAL_OK;
+
+    if (!initializeRobot()) {
+        status = DEAL_GYRO_ERR;
+    }
+    else {
+
+        int numPlayers = 4;
+        int cardsPerPlayer = 1;
+        bool ready = false;
+
+        while (!ready) {
+            numPlayers = getSelection("How many players?",
+                                      MIN_PLAYERS, MAX_PLAYERS, numPlayers);
+
+            // never allow more cards than are in the deck
+            int maxCards = DECK_SIZE / numPlayers;
+            cardsPerPlayer = getSelection("Cards per player?",
+                                          1, maxCards, cardsPerPlayer);
+
+            ready = confirmSetup(numPlayers, cardsPerPlayer);
+        }
+
+        status = dealAllCards(numPlayers, cardsPerPlayer);
+    }
+
+    shutdownRobot(status);
+
+    return 0;
+}
