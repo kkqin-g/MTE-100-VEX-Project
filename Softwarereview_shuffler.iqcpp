@@ -23,24 +23,6 @@ brain Brain;
 inertial BrainInertial = inertial();
 
 
-// generating and setting random seed
-void initializeRandomSeed(){
-  wait(100,msec);
-  double xAxis = BrainInertial.acceleration(xaxis) * 1000;
-  double yAxis = BrainInertial.acceleration(yaxis) * 1000;
-  double zAxis = BrainInertial.acceleration(zaxis) * 1000;
-  int seed = int(
-    xAxis + yAxis + zAxis
-  );
-  srand(seed);
-}
-
-
-void vexcodeInit() {
-
-  initializeRandomSeed();
-}
-
 #pragma endregion VEXcode Generated Robot Configuration
 
 
@@ -62,6 +44,17 @@ struct Settings {
     int minPlayers = 2;
     int maxPlayers = 8;
     int deckSize = 52;
+
+    int gameGoFish = 0;
+    int gameCrazyEights = 1;
+    int gameRummy = 2;
+    int gameHoldem = 3;
+    int gameBlackjack = 4;
+    int gameFiveCardDraw = 5;
+    int gameHeartsSpades = 6;
+    int gameWar = 7;
+    int gameCustom = 8;
+    int numGames = 9;
 
     double rotateMaxSpeed = 70.0;
     double rotateMinSpeed = 10.0;
@@ -208,19 +201,22 @@ int getSelection(const char* label, int minValue, int maxValue, int startValue) 
 
 /*
 FUNCTION 2: confirmSetup
-Purpose: Show the chosen setup and the total cards needed. Check = start dealing, Right = re-enter the setup.
+Purpose: Show the chosen setup and the total cards needed. Check = start shuffling + dealing, Right = re-enter
+         the setup.
 Returns : bool - true to start, false to re-enter
-Params  : numPlayers, cardsPerPlayer
+Params  : gameName, numPlayers, cardsPerPlayer
 */
 
-bool confirmSetup(int numPlayers, int cardsPerPlayer) {
+bool confirmSetup(const char* gameName, int numPlayers, int cardsPerPlayer) {
 
     Brain.Screen.clearScreen();
     Brain.Screen.setCursor(1, 1);
-    Brain.Screen.print("Players: %d", numPlayers);
+    Brain.Screen.print("Game: %s", gameName);
     Brain.Screen.setCursor(2, 1);
-    Brain.Screen.print("Cards each: %d", cardsPerPlayer);
+    Brain.Screen.print("Players: %d", numPlayers);
     Brain.Screen.setCursor(3, 1);
+    Brain.Screen.print("Cards each: %d", cardsPerPlayer);
+    Brain.Screen.setCursor(4, 1);
     Brain.Screen.print("Total cards: %d", numPlayers * cardsPerPlayer);
     Brain.Screen.setCursor(5, 1);
     Brain.Screen.print("Load the cards!");
@@ -796,9 +792,214 @@ void shutdownRobot(int status, Settings cfg) {
 }
 
 
-int main() {
+/*
+FUNCTION 16: getGameName
+Purpose: Turn a game id into its menu name.
+Returns : const char* - the game's name ("Custom" if unknown)
+Params  : game (id), cfg
+*/
 
-    vexcodeInit();
+const char* getGameName(int game, Settings cfg) {
+
+    const char* name = "Custom";
+
+    if (game == cfg.gameGoFish) {
+        name = "Go Fish";
+    }
+    else if (game == cfg.gameCrazyEights) {
+        name = "Crazy Eights";
+    }
+    else if (game == cfg.gameRummy) {
+        name = "Rummy";
+    }
+    else if (game == cfg.gameHoldem) {
+        name = "Texas Hold'em";
+    }
+    else if (game == cfg.gameBlackjack) {
+        name = "Blackjack";
+    }
+    else if (game == cfg.gameFiveCardDraw) {
+        name = "5-Card Draw";
+    }
+    else if (game == cfg.gameHeartsSpades) {
+        name = "Hearts/Spades";
+    }
+    else if (game == cfg.gameWar) {
+        name = "War";
+    }
+
+    return name;
+}
+
+
+/*
+FUNCTION 17: getMinPlayers / FUNCTION 18: getMaxPlayers
+Purpose: The fewest / most players the chosen game allows
+         (the robot itself handles 2 to 8 positions).
+Returns : int - the limit
+Params  : game (id), cfg
+*/
+
+int getMinPlayers(int game, Settings cfg) {
+
+    int minP = cfg.minPlayers;
+
+    if (game == cfg.gameHeartsSpades) {
+        minP = 4;
+    }
+
+    return minP;
+}
+
+int getMaxPlayers(int game, Settings cfg) {
+
+    int maxP = cfg.maxPlayers;
+
+    if (game == cfg.gameGoFish) {
+        maxP = 6;
+    }
+    else if (game == cfg.gameCrazyEights) {
+        maxP = 7;
+    }
+    else if (game == cfg.gameRummy) {
+        maxP = 6;
+    }
+    else if (game == cfg.gameFiveCardDraw) {
+        maxP = 6;
+    }
+    else if (game == cfg.gameHeartsSpades) {
+        maxP = 4;
+    }
+    else if (game == cfg.gameWar) {
+        maxP = 2;
+    }
+
+    return maxP;
+}
+
+
+/*
+FUNCTION 19: getCardsPerPlayer
+Purpose: How many cards each player gets in the chosen game,
+         which can change with the number of players. Never
+         returns more cards than the deck can supply.
+Returns : int - cards per player
+Params  : game (id), numPlayers, cfg
+*/
+
+int getCardsPerPlayer(int game, int numPlayers, Settings cfg) {
+
+    int cards = 1;
+
+    if (game == cfg.gameGoFish) {
+        cards = (numPlayers <= 3) ? 7 : 5;
+    }
+    else if (game == cfg.gameCrazyEights) {
+        cards = (numPlayers == 2) ? 7 : 5;
+    }
+    else if (game == cfg.gameRummy) {
+        if (numPlayers == 2) {
+            cards = 10;
+        }
+        else if (numPlayers <= 4) {
+            cards = 7;
+        }
+        else {
+            cards = 6;
+        }
+    }
+    else if (game == cfg.gameHoldem) {
+        cards = 2;
+    }
+    else if (game == cfg.gameBlackjack) {
+        cards = 2;
+    }
+    else if (game == cfg.gameFiveCardDraw) {
+        cards = 5;
+    }
+    else if (game == cfg.gameHeartsSpades) {
+        cards = 13;
+    }
+    else if (game == cfg.gameWar) {
+        cards = 26;
+    }
+
+
+    if (cards * numPlayers > cfg.deckSize) {
+        cards = cfg.deckSize / numPlayers;
+    }
+
+    return cards;
+}
+
+
+/*
+FUNCTION 20: chooseGame
+Purpose: Let the user scroll through the game menu with
+         Up/Down and confirm with Check.
+Returns : int - the chosen game id
+Params  : startGame (id shown first), cfg
+*/
+
+int chooseGame(int startGame, Settings cfg) {
+
+    int game = startGame;
+    if (game < 0) game = 0;
+    if (game > cfg.numGames - 1) game = cfg.numGames - 1;
+
+    bool confirmed = false;
+    bool redraw = true;
+
+    while (!confirmed) {
+
+        if (redraw) {
+            Brain.Screen.clearScreen();
+            Brain.Screen.setCursor(1, 1);
+            Brain.Screen.print("Choose a game");
+            Brain.Screen.setCursor(3, 1);
+            Brain.Screen.print("%s", getGameName(game, cfg));
+            Brain.Screen.setCursor(4, 1);
+            Brain.Screen.print("(%d of %d)", game + 1, cfg.numGames);
+            Brain.Screen.setCursor(5, 1);
+            Brain.Screen.print("Up/Down = scroll");
+            Brain.Screen.setCursor(6, 1);
+            Brain.Screen.print("Check = confirm");
+            redraw = false;
+        }
+
+        if (Brain.buttonUp.pressing()) {
+            if (game > 0) {
+                game--;
+            }
+            redraw = true;
+            while (Brain.buttonUp.pressing()) {
+                wait(10, msec);
+            }
+        }
+        else if (Brain.buttonDown.pressing()) {
+            if (game < cfg.numGames - 1) {
+                game++;
+            }
+            redraw = true;
+            while (Brain.buttonDown.pressing()) {
+                wait(10, msec);
+            }
+        }
+        else if (Brain.buttonCheck.pressing()) {
+            confirmed = true;
+            while (Brain.buttonCheck.pressing()) {
+                wait(10, msec);
+            }
+        }
+
+        wait(20, msec);
+    }
+
+    return game;
+}
+
+
+int main() {
 
     Settings cfg;
 
@@ -809,19 +1010,36 @@ int main() {
     }
     else {
 
+        int game = cfg.gameGoFish;
         int numPlayers = 4;
         int cardsPerPlayer = 1;
         bool ready = false;
 
         while (!ready) {
-            numPlayers = getSelection("How many players?",
-                                      cfg.minPlayers, cfg.maxPlayers, numPlayers);
 
-            int maxCards = cfg.deckSize / numPlayers;
-            cardsPerPlayer = getSelection("Cards per player?",
-                                          1, maxCards, cardsPerPlayer);
+            game = chooseGame(game, cfg);
 
-            ready = confirmSetup(numPlayers, cardsPerPlayer);
+            int minP = getMinPlayers(game, cfg);
+            int maxP = getMaxPlayers(game, cfg);
+
+            if (minP == maxP) {
+                numPlayers = minP;
+            }
+            else {
+                numPlayers = getSelection("How many players?",
+                                          minP, maxP, numPlayers);
+            }
+
+            if (game == cfg.gameCustom) {
+                int maxCards = cfg.deckSize / numPlayers;
+                cardsPerPlayer = getSelection("Cards per player?",
+                                              1, maxCards, cardsPerPlayer);
+            }
+            else {
+                cardsPerPlayer = getCardsPerPlayer(game, numPlayers, cfg);
+            }
+
+            ready = confirmSetup(getGameName(game, cfg), numPlayers, cardsPerPlayer);
         }
 
         status = shuffleCards(cfg);
